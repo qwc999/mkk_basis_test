@@ -1,0 +1,29 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments and IDE settings
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Temporary files and local databases
+tmp/
+*.db
+*.sqlite
+*.sqlite3
