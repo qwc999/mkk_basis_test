@@ -9,14 +9,14 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
-from app.config import Settings
+from app.config import DatabaseSettings
 
 
 class Base(DeclarativeBase):
     pass
 
 
-def create_engine(settings: Settings) -> AsyncEngine:
+def create_engine(settings: DatabaseSettings) -> AsyncEngine:
     return create_async_engine(
         settings.database_url.get_secret_value(),
         pool_pre_ping=True,

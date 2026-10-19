@@ -5,7 +5,7 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.config import load_settings
+from app.config import DatabaseSettings, load_settings
 from app.db import Base
 from app.models import Outbox, Payment  # noqa: F401 -- register the complete schema
 
@@ -21,7 +21,7 @@ def run_migrations(connection):
 
 async def run_online():
     engine = create_async_engine(
-        load_settings().database_url.get_secret_value(),
+        load_settings(DatabaseSettings).database_url.get_secret_value(),
         poolclass=pool.NullPool,
         hide_parameters=True,
         connect_args={"server_settings": {"timezone": "UTC"}},
@@ -35,7 +35,7 @@ async def run_online():
 
 if context.is_offline_mode():
     context.configure(
-        url=load_settings().database_url.get_secret_value(),
+        url=load_settings(DatabaseSettings).database_url.get_secret_value(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},

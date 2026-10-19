@@ -2,15 +2,17 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import httpx
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
-from app.config import Settings
+from app.config import Settings, WorkerSettings
 from app.db import create_engine, create_session_factory
 from app.main import create_app
+from app.messaging import create_broker, declare_topology
 
 TEST_API_KEY = "test-only-api-key"
 
@@ -90,3 +92,41 @@ def payment_data():
         "metadata": {"order_id": "order-123"},
         "webhook_url": "https://example.com/webhooks/payments",
     }
+
+
+def validate_test_rabbitmq_url(raw_url: str) -> str:
+    url = urlsplit(raw_url)
+    if (
+        url.scheme != "amqp"
+        or url.username != "payments_test"
+        or unquote(url.path) != "/payments_test"
+        or not url.hostname
+    ):
+        raise ValueError("Tests require RabbitMQ user AND vhost named payments_test")
+    return raw_url
+
+
+@pytest.fixture
+def worker_settings(database_url):
+    raw_url = os.environ.get("TEST_RABBITMQ_URL")
+    if not raw_url:
+        pytest.fail("Set TEST_RABBITMQ_URL to the dedicated payments_test vhost; see README")
+    return WorkerSettings(
+        database_url=database_url,
+        rabbitmq_url=validate_test_rabbitmq_url(raw_url),
+        outbox_poll_interval=0.05,
+        outbox_publish_timeout=1,
+        _env_file=None,
+    )
+
+
+@pytest.fixture
+async def rabbit(worker_settings):
+    broker = create_broker(worker_settings)
+    try:
+        await broker.connect()
+        queue = await declare_topology(broker)
+        await queue.purge()
+        yield broker, queue
+    finally:
+        await broker.stop()

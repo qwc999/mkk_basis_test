@@ -11,7 +11,7 @@ from tests.test_payments import row_counts
 
 async def test_migration_schema(engine):
     async with engine.connect() as connection:
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0001"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002"
         columns = (
             await connection.execute(
                 text(
