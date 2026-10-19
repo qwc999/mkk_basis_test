@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api import router
 from app.config import Settings, load_settings
 from app.db import create_engine, create_session_factory
 
@@ -32,4 +33,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.state.settings = settings
+    app.include_router(router)
     return app
