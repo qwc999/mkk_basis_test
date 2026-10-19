@@ -85,7 +85,7 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
                 "amount": "1500.00",
                 "currency": "RUB",
                 "description": key,
-                "webhook_url": "https://example.com/webhook",
+                "webhook_url": "http://api:9000/webhook",
             },
             key,
         )
@@ -129,6 +129,19 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
         compose("build", "api", "consumer")
         compose("up", "-d", "--wait", "postgres", "rabbitmq")
         compose("run", "--rm", "api", "python", "-m", "alembic", "upgrade", "0001")
+        # Seed the old schema directly: the current ORM requires the latest columns.
+        legacy = {"payment_id": str(uuid4())}
+        payload = json.dumps(legacy)
+        sql(
+            "BEGIN; INSERT INTO payments "
+            "(id, amount, currency, description, idempotency_key, webhook_url) "
+            f"VALUES ('{legacy['payment_id']}', 1500, 'RUB', 'legacy', 'legacy', "
+            "'http://api:9000/webhook'); "
+            "INSERT INTO outbox (id, event_type, payload) "
+            f"VALUES ('{uuid4()}', 'payments.new', '{payload}'::jsonb); COMMIT;"
+        )
+        compose("run", "--rm", "api", "python", "-m", "alembic", "upgrade", "head")
+        compose("run", "--rm", "api", "python", "-m", "alembic", "check")
         compose("up", "-d", "api")
         for _ in range(50):
             try:
@@ -141,12 +154,21 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
                 time.sleep(0.2)
         else:
             raise RuntimeError("API did not become ready")
-        legacy = create("legacy-before-migration-0002")
-        compose("run", "--rm", "api", "python", "-m", "alembic", "upgrade", "head")
-        compose("run", "--rm", "api", "python", "-m", "alembic", "check")
+        # A temporary receiver keeps the existing processing checks independent of retries.
+        receiver = """
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(204)
+            self.end_headers()
+        def log_message(self, *args):
+            pass
+    HTTPServer(('0.0.0.0', 9000), Receiver).serve_forever()"""
+        compose("exec", "-d", "api", "python", "-c", dedent(receiver))
         compose("up", "-d", "consumer")
         final(legacy)
-        print("Migration 0001 -> 0002 preserved and processed the existing payment", flush=True)
+        print("Migration 0001 -> head preserved and processed the existing payment", flush=True)
 
         normal = create("normal-processing")
         started = time.monotonic()
