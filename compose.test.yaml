@@ -15,12 +15,35 @@ services:
       timeout: 3s
       retries: 30
 
+  rabbitmq:
+    image: rabbitmq:4.1.4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments_test
+      RABBITMQ_DEFAULT_PASS: test-only
+      RABBITMQ_DEFAULT_VHOST: payments_test
+    volumes:
+      - rabbitmq_test_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 10s
+      timeout: 15s
+      start_period: 20s
+      retries: 30
+
   tests:
     build:
       context: .
       target: tests
     environment:
       TEST_DATABASE_URL: postgresql+asyncpg://payments_test:test-only@postgres:5432/payments_test
+      TEST_RABBITMQ_URL: amqp://payments_test:test-only@rabbitmq:5672/payments_test
+      TEST_RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
     depends_on:
       postgres:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  rabbitmq_test_data:
