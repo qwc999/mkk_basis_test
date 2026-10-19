@@ -133,3 +133,11 @@ async def rabbit(worker_settings):
         yield broker, queue
     finally:
         await broker.stop()
+
+
+@pytest.fixture
+async def webhook_client():
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(204))
+    ) as client:
+        yield client

@@ -1,7 +1,8 @@
 import time
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from aio_pika import DeliveryMode
 from aio_pika.exceptions import PublishError
@@ -9,6 +10,7 @@ from aio_pika.exceptions import PublishError
 from app.messaging import DLQ_QUEUE, DLX_EXCHANGE, RETRY_EXCHANGE, RETRY_QUEUES
 from app.outbox import PublicationNotConfirmed
 from app.retries import retry_or_dead_letter
+from app.worker import consume_payment
 from tests.test_worker import queue_empty, send, wait_until
 
 
@@ -41,16 +43,29 @@ async def test_both_retry_stages_return_through_queue_ttl(rabbit):
     await returned.ack()
 
 
-async def test_third_failure_goes_to_dlq_without_another_retry(rabbit):
+async def test_third_failure_goes_to_dlq_without_another_retry(
+    client, headers, payment_data, session_factory, rabbit
+):
     broker, queue = rabbit
-    body = {"payment_id": str(uuid4())}
-    await send(broker, body)
+    response = await client.post("/api/v1/payments", headers=headers, json=payment_data)
+    body = {"payment_id": str(UUID(response.json()["payment_id"]))}
+    await send(broker, body, event_headers={"x-attempt": 3})
     message = await queue.get(timeout=3)
-    await retry_or_dead_letter(message, broker, attempt=3, reason="processing_error")
+    requests = []
+
+    def unavailable(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable)) as http:
+        await consume_payment(
+            message, session_factory, broker, http, AsyncMock(return_value="succeeded")
+        )
+    assert len(requests) == 1
     dlq = await broker.declare_queue(DLQ_QUEUE)
     dead = await dlq.get(timeout=3)
     assert dead.body == message.body and dead.message_id == message.message_id
-    assert dead.headers == {"x-attempt": 3, "x-error-category": "processing_error"}
+    assert dead.headers == {"x-attempt": 3, "x-error-category": "webhook_error"}
     assert dead.delivery_mode == DeliveryMode.PERSISTENT
     await dead.ack()
     assert await queue_empty(queue)

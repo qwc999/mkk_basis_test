@@ -11,12 +11,13 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from app.config import WorkerSettings, load_settings
 from app.db import create_engine, create_session_factory
-from app.messaging import PAYMENTS_EXCHANGE, PAYMENTS_QUEUE, create_broker
+from app.messaging import PAYMENTS_EXCHANGE, PAYMENTS_QUEUE, create_broker, declare_topology
 from app.outbox import publish_outbox
 from app.processing import PaymentNotFound, Simulator, process_payment, simulate_payment
+from app.retries import retry_or_dead_letter
+from app.webhooks import create_http_client, deliver_webhook
 
 logger = logging.getLogger(__name__)
-TECHNICAL_ERROR_PAUSE = 2.0
 
 
 class PaymentEvent(BaseModel):
@@ -24,30 +25,56 @@ class PaymentEvent(BaseModel):
     payment_id: UUID
 
 
-async def consume_payment(message, sessions, simulator: Simulator = simulate_payment) -> None:
+async def consume_payment(
+    message,
+    sessions,
+    broker,
+    http_client,
+    simulator: Simulator = simulate_payment,
+    *,
+    publish_timeout: float = 5,
+) -> None:
+    attempt = message.headers.get("x-attempt", 1)
+    if type(attempt) is not int or not 1 <= attempt <= 3:
+        await retry_or_dead_letter(
+            message, broker, attempt=None, reason="invalid_message", publish_timeout=publish_timeout
+        )
+        return
     try:
         event = PaymentEvent.model_validate_json(message.body)
     except ValidationError:
-        logger.warning("Invalid payment event discarded")
-        await message.reject(requeue=False)
+        await retry_or_dead_letter(
+            message,
+            broker,
+            attempt=attempt,
+            reason="invalid_message",
+            publish_timeout=publish_timeout,
+        )
         return
+    reason = "processing_error"
     try:
         await process_payment(sessions, event.payment_id, simulator)
+        reason = "webhook_error"
+        await deliver_webhook(sessions, event.payment_id, http_client)
     except PaymentNotFound:
-        logger.warning("Payment event discarded: payment_id=%s does not exist", event.payment_id)
-        await message.reject(requeue=False)
+        await retry_or_dead_letter(
+            message,
+            broker,
+            attempt=attempt,
+            reason="payment_not_found",
+            publish_timeout=publish_timeout,
+        )
         return
-    except Exception as exc:
-        # No ACK on technical failure; with prefetch=1 this pauses consumption.
-        logger.error("Payment processing failed (%s); requeue after pause", type(exc).__name__)
-        await asyncio.sleep(TECHNICAL_ERROR_PAUSE)
-        await message.nack(requeue=True)
+    except Exception:
+        await retry_or_dead_letter(
+            message, broker, attempt=attempt, reason=reason, publish_timeout=publish_timeout
+        )
         return
     await message.ack()
 
 
 async def raw_body(message):
-    # Validate malformed JSON ourselves so it is explicitly rejected, not left unacked.
+    # Keep malformed JSON available for explicit validation and transfer to DLQ.
     return message.body
 
 
@@ -57,6 +84,7 @@ async def run_worker(
     engine = create_engine(settings)
     sessions = create_session_factory(engine)
     broker = create_broker(settings)
+    http_client = create_http_client()
     failed = asyncio.get_running_loop().create_future()
     sender = None
     stopped = asyncio.create_task(stop.wait())
@@ -70,7 +98,14 @@ async def run_worker(
     )
     async def handle(message: RabbitMessage):
         try:
-            await consume_payment(message, sessions, simulator)
+            await consume_payment(
+                message,
+                sessions,
+                broker,
+                http_client,
+                simulator,
+                publish_timeout=settings.outbox_publish_timeout,
+            )
         except Exception as exc:
             logger.error("Consumer transport failed (%s); stopping worker", type(exc).__name__)
             if not failed.done():
@@ -80,6 +115,8 @@ async def run_worker(
         while not stop.is_set():
             try:
                 async with asyncio.timeout(10):
+                    await broker.connect()
+                    await declare_topology(broker)
                     await broker.start()
                 break
             except (AMQPException, ChannelInvalidStateError, OSError, TimeoutError) as exc:
@@ -111,7 +148,10 @@ async def run_worker(
         try:
             await broker.stop()
         finally:
-            await engine.dispose()
+            try:
+                await http_client.aclose()
+            finally:
+                await engine.dispose()
         logger.info("Payment worker stopped")
 
 
@@ -129,7 +169,7 @@ async def serve(settings: WorkerSettings) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     # Transport libraries can include connection URLs in reconnect/exception logs.
-    for name in ("aio_pika", "aiormq"):
+    for name in ("aio_pika", "aiormq", "httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
     try:
         settings = load_settings(WorkerSettings)
