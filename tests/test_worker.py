@@ -10,9 +10,25 @@ import pytest
 from faststream.rabbit import Channel, RabbitBroker
 from sqlalchemy import select, text
 
-from app.messaging import PAYMENTS_EXCHANGE, PAYMENTS_QUEUE, create_broker, declare_topology
+from app.messaging import (
+    DLQ_QUEUE,
+    PAYMENTS_EXCHANGE,
+    PAYMENTS_QUEUE,
+    create_broker,
+    declare_topology,
+)
 from app.models import Outbox, Payment
 from app.worker import consume_payment, run_worker
+
+
+@pytest.fixture(autouse=True)
+def mock_webhooks(monkeypatch):
+    monkeypatch.setattr(
+        "app.worker.create_http_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(204))
+        ),
+    )
 
 
 async def wait_until(check):
@@ -47,7 +63,7 @@ async def queue_empty(queue):
     return queue.declaration_result.message_count == 0
 
 
-async def send(broker, body, message_id=None):
+async def send(broker, body, message_id=None, *, event_headers=None):
     await broker.publish(
         body,
         exchange=PAYMENTS_EXCHANGE,
@@ -56,6 +72,7 @@ async def send(broker, body, message_id=None):
         mandatory=True,
         timeout=2,
         message_id=message_id or str(uuid4()),
+        headers=event_headers,
     )
 
 
@@ -82,7 +99,7 @@ async def test_worker_processes_outbox_and_ignores_duplicate_message_ids(
     assert await queue.get(fail=False) is None
 
 
-async def test_technical_failure_requeues_and_is_retried(
+async def test_technical_failure_uses_scheduled_retry(
     client, headers, payment_data, session_factory, worker_settings, rabbit, monkeypatch
 ):
     response = await client.post("/api/v1/payments", headers=headers, json=payment_data)
@@ -91,63 +108,88 @@ async def test_technical_failure_requeues_and_is_retried(
     deliveries = []
     original = consume_payment
 
-    async def observe(message, sessions, sim):
-        deliveries.append(message.raw_message.redelivered)
-        await original(message, sessions, sim)
+    async def observe(message, *args, **kwargs):
+        deliveries.append(message.headers.get("x-attempt", 1))
+        await original(message, *args, **kwargs)
 
     monkeypatch.setattr("app.worker.consume_payment", observe)
-    monkeypatch.setattr("app.worker.TECHNICAL_ERROR_PAUSE", 0.05)
     async with worker(worker_settings, simulator):
         await wait_until(lambda: final(session_factory, payment_id))
     assert simulator.await_count == 2
-    assert deliveries == [False, True]
+    assert deliveries == [1, 2]
 
 
 @pytest.mark.parametrize(
-    "body",
-    [b"{broken", b"{}", b'{"payment_id":"bad"}', json.dumps({"payment_id": str(uuid4())}).encode()],
+    ("body", "event_headers", "category"),
+    [
+        (b"{broken", {}, "invalid_message"),
+        (b"{}", {}, "invalid_message"),
+        (b'{"payment_id":"bad"}', {}, "invalid_message"),
+        (json.dumps({"payment_id": str(uuid4())}).encode(), {}, "payment_not_found"),
+        *[
+            (
+                json.dumps({"payment_id": str(uuid4())}).encode(),
+                {"x-attempt": value},
+                "invalid_message",
+            )
+            for value in (0, 4, "2", True, None, 2.0)
+        ],
+    ],
 )
-async def test_invalid_or_unknown_payment_is_rejected_without_requeue(
-    worker_settings, session_factory, rabbit, body
+async def test_invalid_or_unknown_payment_goes_directly_to_dlq(
+    session_factory, rabbit, webhook_client, body, event_headers, category
 ):
     broker, queue = rabbit
     simulator = AsyncMock()
-    # Directly retrieve the real RabbitMQ message to inspect redelivery after reject.
-    await send(broker, body)
+    await send(broker, body, event_headers=event_headers)
     message = await queue.get(timeout=3)
-    await consume_payment(message, session_factory, simulator)
+    await consume_payment(message, session_factory, broker, webhook_client, simulator)
     assert message.processed
     assert await queue.get(fail=False) is None
     simulator.assert_not_awaited()
+    dlq = await broker.declare_queue(DLQ_QUEUE)
+    dead = await dlq.get(timeout=3)
+    assert dead.body == body and dead.message_id == message.message_id
+    assert dead.headers["x-error-category"] == category
+    await dead.ack()
 
 
-async def test_database_commit_failure_does_not_ack(
-    client, headers, payment_data, session_factory, engine, rabbit, monkeypatch
+async def test_database_commit_failure_schedules_retry_before_ack(
+    client, headers, payment_data, session_factory, engine, rabbit, webhook_client
 ):
     response = await client.post("/api/v1/payments", headers=headers, json=payment_data)
     payment_id = UUID(response.json()["payment_id"])
     broker, queue = rabbit
     await send(broker, {"payment_id": str(payment_id)})
     message = await queue.get(timeout=3)
-    monkeypatch.setattr("app.worker.TECHNICAL_ERROR_PAUSE", 0.01)
     async with engine.begin() as connection:
         await connection.execute(
             text("ALTER TABLE payments ADD CONSTRAINT pending_only CHECK (status = 'pending')")
         )
     try:
-        await consume_payment(message, session_factory, AsyncMock(return_value="succeeded"))
+        await consume_payment(
+            message, session_factory, broker, webhook_client, AsyncMock(return_value="succeeded")
+        )
         assert await payment_state(session_factory, payment_id) == ("pending", None)
+        assert message.processed
+
+        async def returned():
+            return not await queue_empty(queue)
+
+        await wait_until(returned)
         redelivered = await queue.get(timeout=3)
-        assert redelivered.redelivered
+        assert redelivered.headers["x-attempt"] == 2
     finally:
         async with engine.begin() as connection:
             await connection.execute(text("ALTER TABLE payments DROP CONSTRAINT pending_only"))
-    await consume_payment(redelivered, session_factory, AsyncMock(return_value="failed"))
+    await consume_payment(
+        redelivered, session_factory, broker, webhook_client, AsyncMock(return_value="failed")
+    )
     assert (await payment_state(session_factory, payment_id))[0] == "failed"
 
 
 async def test_lost_ack_after_commit_is_safe_on_redelivery(
-    client, headers, payment_data, session_factory, worker_settings, rabbit
+    client, headers, payment_data, session_factory, worker_settings, rabbit, webhook_client
 ):
     response = await client.post("/api/v1/payments", headers=headers, json=payment_data)
     payment_id = UUID(response.json()["payment_id"])
@@ -157,12 +199,16 @@ async def test_lost_ack_after_commit_is_safe_on_redelivery(
 
     class LostAck:
         body = message.body
+        headers = message.headers
+        message_id = message.message_id
 
         async def ack(self):
             raise ConnectionError("connection lost before ACK")
 
     with pytest.raises(ConnectionError):
-        await consume_payment(LostAck(), session_factory, AsyncMock(return_value="succeeded"))
+        await consume_payment(
+            LostAck(), session_factory, broker, webhook_client, AsyncMock(return_value="succeeded")
+        )
     original = await payment_state(session_factory, payment_id)
     await broker.stop()  # Closing a connection returns its unacknowledged delivery.
     replacement = create_broker(worker_settings)
@@ -172,7 +218,7 @@ async def test_lost_ack_after_commit_is_safe_on_redelivery(
         redelivered = await restored_queue.get(timeout=3)
         assert redelivered.redelivered
         simulator = AsyncMock()
-        await consume_payment(redelivered, session_factory, simulator)
+        await consume_payment(redelivered, session_factory, replacement, webhook_client, simulator)
         simulator.assert_not_awaited()
         assert await payment_state(session_factory, payment_id) == original
     finally:
@@ -207,7 +253,14 @@ async def test_idle_worker_stops_cleanly(worker_settings, engine, rabbit):
 
 
 async def test_shutdown_returns_inflight_message_and_rolls_back(
-    client, headers, payment_data, session_factory, worker_settings, rabbit, monkeypatch
+    client,
+    headers,
+    payment_data,
+    session_factory,
+    worker_settings,
+    rabbit,
+    monkeypatch,
+    webhook_client,
 ):
     broker, queue = rabbit
     entered = asyncio.Event()
@@ -234,11 +287,13 @@ async def test_shutdown_returns_inflight_message_and_rolls_back(
     assert await payment_state(session_factory, payment_id) == ("pending", None)
     redelivered = await queue.get(timeout=3)
     assert redelivered.redelivered
-    await consume_payment(redelivered, session_factory, AsyncMock(return_value="succeeded"))
+    await consume_payment(
+        redelivered, session_factory, broker, webhook_client, AsyncMock(return_value="succeeded")
+    )
     assert (await payment_state(session_factory, payment_id))[0] == "succeeded"
 
 
-async def test_real_subscriber_discards_invalid_json(worker_settings, engine, rabbit):
+async def test_real_subscriber_routes_invalid_json_to_dlq(worker_settings, engine, rabbit):
     broker, queue = rabbit
     simulator = AsyncMock()
 
@@ -252,6 +307,10 @@ async def test_real_subscriber_discards_invalid_json(worker_settings, engine, ra
         await wait_until(lambda: queue_empty(queue))
     simulator.assert_not_awaited()
     assert await queue.get(fail=False) is None
+    dlq = await broker.declare_queue(DLQ_QUEUE)
+    dead = await dlq.get(timeout=3)
+    assert dead.headers["x-error-category"] == "invalid_message"
+    await dead.ack()
 
 
 async def test_prefetch_one_serializes_real_handler(

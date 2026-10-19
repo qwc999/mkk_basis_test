@@ -47,6 +47,7 @@ class Payment(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC), server_default=func.now()
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    webhook_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Outbox(Base):

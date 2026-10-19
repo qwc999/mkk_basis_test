@@ -11,7 +11,7 @@ from tests.test_payments import row_counts
 
 async def test_migration_schema(engine):
     async with engine.connect() as connection:
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0003"
         columns = (
             await connection.execute(
                 text(
@@ -24,6 +24,7 @@ async def test_migration_schema(engine):
         assert column_info["amount"] == ("numeric", 18, 2)
         assert column_info["created_at"][0] == "timestamp with time zone"
         assert column_info["processed_at"][0] == "timestamp with time zone"
+        assert column_info["webhook_delivered_at"][0] == "timestamp with time zone"
         assert column_info["metadata"][0] == "jsonb"
 
 

@@ -78,18 +78,18 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, json.load(response)
 
-    def create(key):
+    def create(key, webhook_path="/webhook"):
         status, payment = api(
             "/api/v1/payments",
             {
                 "amount": "1500.00",
                 "currency": "RUB",
                 "description": key,
-                "webhook_url": "https://example.com/webhook",
+                "webhook_url": "http://api:9000" + webhook_path,
             },
             key,
         )
-        assert status == 202 and payment["status"] == "pending"
+        assert status == 202
         return payment
 
     def final(payment):
@@ -107,7 +107,7 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
             "exec", "-T", "postgres", "psql", "-U", "payments", "-d", "payments", "-Atc", query
         )
 
-    def queue_size():
+    def queue_size(name="payments.new"):
         output = compose(
             "exec",
             "-T",
@@ -121,14 +121,43 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
             "messages_ready",
             "messages_unacknowledged",
         )
-        row = next(line.split() for line in output.splitlines() if line.startswith("payments.new"))
+        row = next(line.split() for line in output.splitlines() if line.split()[0] == name)
         return tuple(map(int, row[1:]))
+
+    def deliveries(payment):
+        received = compose(
+            "exec",
+            "-T",
+            "api",
+            "python",
+            "-c",
+            "import urllib.request; "
+            "print(urllib.request.urlopen('http://127.0.0.1:9000/requests').read().decode())",
+        )
+        return [
+            item
+            for item in json.loads(received)
+            if item["body"]["payment_id"] == payment["payment_id"]
+        ]
 
     try:
         print("Building the API and consumer images", flush=True)
         compose("build", "api", "consumer")
         compose("up", "-d", "--wait", "postgres", "rabbitmq")
         compose("run", "--rm", "api", "python", "-m", "alembic", "upgrade", "0001")
+        # Seed the old schema directly: the current ORM requires the latest columns.
+        legacy = {"payment_id": str(uuid4())}
+        payload = json.dumps(legacy)
+        sql(
+            "BEGIN; INSERT INTO payments "
+            "(id, amount, currency, description, idempotency_key, webhook_url) "
+            f"VALUES ('{legacy['payment_id']}', 1500, 'RUB', 'legacy', 'legacy', "
+            "'http://api:9000/webhook'); "
+            "INSERT INTO outbox (id, event_type, payload) "
+            f"VALUES ('{uuid4()}', 'payments.new', '{payload}'::jsonb); COMMIT;"
+        )
+        compose("run", "--rm", "api", "python", "-m", "alembic", "upgrade", "head")
+        compose("run", "--rm", "api", "python", "-m", "alembic", "check")
         compose("up", "-d", "api")
         for _ in range(50):
             try:
@@ -141,12 +170,32 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
                 time.sleep(0.2)
         else:
             raise RuntimeError("API did not become ready")
-        legacy = create("legacy-before-migration-0002")
-        compose("run", "--rm", "api", "python", "-m", "alembic", "upgrade", "head")
-        compose("run", "--rm", "api", "python", "-m", "alembic", "check")
+        # Exercise real HTTP from the worker without adding a service to the product stack.
+        receiver = """
+    import json, time
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    requests = []
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            requests.append({'body': body, 'time': time.monotonic(),
+                             'key': self.headers.get('Idempotency-Key')})
+            self.send_response(503 if self.path == '/fail' else 204)
+            self.end_headers()
+        def do_GET(self):
+            body = json.dumps(requests).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    HTTPServer(('0.0.0.0', 9000), Receiver).serve_forever()"""
+        compose("exec", "-d", "api", "python", "-c", dedent(receiver))
         compose("up", "-d", "consumer")
         final(legacy)
-        print("Migration 0001 -> 0002 preserved and processed the existing payment", flush=True)
+        print("Migration 0001 -> head preserved and processed the existing payment", flush=True)
 
         normal = create("normal-processing")
         started = time.monotonic()
@@ -154,6 +203,29 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
         elapsed = time.monotonic() - started
         assert 2 <= elapsed < 12, elapsed
         print(f"Real asynchronous processing completed in {elapsed:.2f}s", flush=True)
+        for _ in range(40):
+            if (
+                sql(
+                    "SELECT webhook_delivered_at IS NOT NULL FROM payments "
+                    f"WHERE id = '{normal['payment_id']}'"
+                )
+                == "t"
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("Successful webhook was not recorded")
+        normal_result = api("/api/v1/payments/" + normal["payment_id"])[1]
+        requests = deliveries(normal)
+        assert len(requests) == 1
+        assert requests[0]["key"] == normal["payment_id"]
+        assert requests[0]["body"]["status"] == normal_result["status"]
+        assert requests[0]["body"]["amount"] == "1500.00"
+        replay = create("normal-processing")
+        assert replay == {**normal, "status": normal_result["status"]}
+        assert sql("SELECT count(*) FROM payments") == "2"
+        assert sql("SELECT count(*) FROM outbox") == "2"
+        print("HTTP webhook delivered; Idempotency-Key replay created no duplicates", flush=True)
         consumer_id = compose("ps", "-q", "consumer")
         restarts_before = subprocess.check_output(
             ["docker", "inspect", "--format", "{{.RestartCount}}", consumer_id],
@@ -207,6 +279,36 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
         final(persisted)
         assert sql("SELECT count(*) FROM payments WHERE processed_at IS NOT NULL") == "4"
         assert sql("SELECT count(*) FROM outbox WHERE published_at IS NOT NULL") == "4"
+
+        failing = create("always-failing-webhook", "/fail")
+        failing_result = final(failing)
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline:
+            if queue_size("payments.dlq") == (1, 0):
+                break
+            time.sleep(0.2)
+        else:
+            raise AssertionError("Failed webhook did not reach DLQ")
+        requests = deliveries(failing)
+        assert len(requests) == 3, len(requests)
+        delays = [requests[i + 1]["time"] - requests[i]["time"] for i in range(2)]
+        assert delays[0] >= 0.9 and delays[1] >= 1.9, delays
+        assert all(item["key"] == failing["payment_id"] for item in requests)
+        assert all(item["body"] == requests[0]["body"] for item in requests)
+        assert api("/api/v1/payments/" + failing["payment_id"])[1] == failing_result
+        assert (
+            sql(
+                "SELECT webhook_delivered_at IS NULL FROM payments "
+                f"WHERE id = '{failing['payment_id']}'"
+            )
+            == "t"
+        )
+        assert queue_size() == (0, 0)
+        print(
+            f"HTTP 503: exactly three attempts, delays {delays[0]:.2f}s/{delays[1]:.2f}s, "
+            "then DLQ; payment result preserved",
+            flush=True,
+        )
         compose("stop", "consumer")
         consumer_id = compose("ps", "-a", "-q", "consumer")
         exit_code = subprocess.check_output(

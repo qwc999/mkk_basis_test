@@ -18,6 +18,7 @@ COPY requirements-dev.txt ./
 RUN python -m pip install --no-cache-dir -r requirements-dev.txt
 COPY pyproject.toml ./
 COPY tests ./tests
+COPY scripts ./scripts
 USER app
 CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
 
