@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from app.config import Settings, WorkerSettings
 from app.db import create_engine, create_session_factory
 from app.main import create_app
-from app.messaging import create_broker, declare_topology
+from app.messaging import DLQ_QUEUE, RETRY_QUEUES, create_broker, declare_topology
 
 TEST_API_KEY = "test-only-api-key"
 
@@ -126,6 +126,9 @@ async def rabbit(worker_settings):
     try:
         await broker.connect()
         queue = await declare_topology(broker)
+        for schema in (*RETRY_QUEUES.values(), DLQ_QUEUE):
+            extra_queue = await broker.declare_queue(schema)
+            await extra_queue.purge()
         await queue.purge()
         yield broker, queue
     finally:
