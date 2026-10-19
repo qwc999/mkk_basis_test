@@ -2,7 +2,17 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import CheckConstraint, DateTime, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    Index,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -41,6 +51,14 @@ class Payment(Base):
 
 class Outbox(Base):
     __tablename__ = "outbox"
+    __table_args__ = (
+        Index(
+            "ix_outbox_unpublished_payments",
+            "created_at",
+            "id",
+            postgresql_where=text("published_at IS NULL AND event_type = 'payments.new'"),
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     event_type: Mapped[str] = mapped_column(String(255))
