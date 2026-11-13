@@ -2,75 +2,28 @@ import asyncio
 import logging
 import signal
 from contextlib import suppress
-from uuid import UUID
 
 from aio_pika.exceptions import AMQPException, ChannelInvalidStateError
 from faststream import AckPolicy
 from faststream.rabbit.annotations import RabbitMessage
-from pydantic import BaseModel, ConfigDict, ValidationError
 
+from app.application.consumer import consume_payment
+from app.application.outbox import publish_outbox
+from app.application.ports import PaymentGateway
 from app.config import WorkerSettings, load_settings
-from app.db import create_engine, create_session_factory
-from app.messaging import PAYMENTS_EXCHANGE, PAYMENTS_QUEUE, create_broker, declare_topology
-from app.outbox import publish_outbox
-from app.processing import PaymentNotFound, Simulator, process_payment, simulate_payment
-from app.retries import retry_or_dead_letter
-from app.webhooks import create_http_client, deliver_webhook
+from app.infrastructure.database.base import create_engine, create_session_factory
+from app.infrastructure.database.uow import create_uow_factory
+from app.infrastructure.gateway import SimulatedPaymentGateway
+from app.infrastructure.messaging import (
+    PAYMENTS_EXCHANGE,
+    PAYMENTS_QUEUE,
+    RabbitEventPublisher,
+    create_broker,
+    declare_topology,
+)
+from app.infrastructure.webhooks import HttpxWebhookSender, create_http_client
 
 logger = logging.getLogger(__name__)
-
-
-class PaymentEvent(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    payment_id: UUID
-
-
-async def consume_payment(
-    message,
-    sessions,
-    broker,
-    http_client,
-    simulator: Simulator = simulate_payment,
-    *,
-    publish_timeout: float = 5,
-) -> None:
-    attempt = message.headers.get("x-attempt", 1)
-    if type(attempt) is not int or not 1 <= attempt <= 3:
-        await retry_or_dead_letter(
-            message, broker, attempt=None, reason="invalid_message", publish_timeout=publish_timeout
-        )
-        return
-    try:
-        event = PaymentEvent.model_validate_json(message.body)
-    except ValidationError:
-        await retry_or_dead_letter(
-            message,
-            broker,
-            attempt=attempt,
-            reason="invalid_message",
-            publish_timeout=publish_timeout,
-        )
-        return
-    reason = "processing_error"
-    try:
-        await process_payment(sessions, event.payment_id, simulator)
-        reason = "webhook_error"
-        await deliver_webhook(sessions, event.payment_id, http_client)
-    except PaymentNotFound:
-        await retry_or_dead_letter(
-            message,
-            broker,
-            attempt=attempt,
-            reason="payment_not_found",
-            publish_timeout=publish_timeout,
-        )
-        return
-    except Exception:
-        await retry_or_dead_letter(
-            message, broker, attempt=attempt, reason=reason, publish_timeout=publish_timeout
-        )
-        return
-    await message.ack()
 
 
 async def raw_body(message):
@@ -79,12 +32,15 @@ async def raw_body(message):
 
 
 async def run_worker(
-    settings: WorkerSettings, stop: asyncio.Event, simulator: Simulator = simulate_payment
+    settings: WorkerSettings, stop: asyncio.Event, gateway: PaymentGateway | None = None
 ) -> None:
     engine = create_engine(settings)
-    sessions = create_session_factory(engine)
+    uows = create_uow_factory(create_session_factory(engine))
     broker = create_broker(settings)
     http_client = create_http_client()
+    webhook_sender = HttpxWebhookSender(http_client)
+    publisher = RabbitEventPublisher(broker, settings.outbox_publish_timeout)
+    gateway = gateway if gateway is not None else SimulatedPaymentGateway()
     failed = asyncio.get_running_loop().create_future()
     sender = None
     stopped = asyncio.create_task(stop.wait())
@@ -98,14 +54,7 @@ async def run_worker(
     )
     async def handle(message: RabbitMessage):
         try:
-            await consume_payment(
-                message,
-                sessions,
-                broker,
-                http_client,
-                simulator,
-                publish_timeout=settings.outbox_publish_timeout,
-            )
+            await consume_payment(message, uows, publisher, webhook_sender, gateway)
         except Exception as exc:
             logger.error("Consumer transport failed (%s); stopping worker", type(exc).__name__)
             if not failed.done():
@@ -129,7 +78,7 @@ async def run_worker(
             return
         logger.info("Payment worker started")
         sender = asyncio.create_task(
-            publish_outbox(sessions, broker, settings), name="outbox-sender"
+            publish_outbox(uows, publisher, settings.outbox_poll_interval), name="outbox-sender"
         )
         done, _ = await asyncio.wait({sender, stopped, failed}, return_when=asyncio.FIRST_COMPLETED)
         if failed in done:

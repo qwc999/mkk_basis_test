@@ -5,12 +5,10 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from aio_pika import DeliveryMode
-from aio_pika.exceptions import PublishError
 
-from app.messaging import DLQ_QUEUE, DLX_EXCHANGE, RETRY_EXCHANGE, RETRY_QUEUES
-from app.outbox import PublicationNotConfirmed
-from app.retries import retry_or_dead_letter
-from app.worker import consume_payment
+from app.application.errors import PublicationError, PublicationNotConfirmed
+from app.infrastructure.messaging import DLQ_QUEUE, DLX_EXCHANGE, RETRY_EXCHANGE, RETRY_QUEUES
+from tests.integration_helpers import consume_payment, retry_or_dead_letter
 from tests.test_worker import queue_empty, send, wait_until
 
 
@@ -85,13 +83,13 @@ async def test_failed_transfer_does_not_ack_original(rabbit, attempt, failure, m
     exchange = await broker.declare_exchange(exchange_schema)
     if failure == "unroutable":
         await target.unbind(exchange, routing_key=schema.routing_key)
-        expected = PublishError
+        expected = PublicationError
     elif failure == "no_confirm":
         monkeypatch.setattr(broker, "publish", AsyncMock(return_value=None))
         expected = PublicationNotConfirmed
     else:
         monkeypatch.setattr(broker, "publish", AsyncMock(side_effect=ConnectionError))
-        expected = ConnectionError
+        expected = PublicationError
     try:
         with pytest.raises(expected):
             await retry_or_dead_letter(message, broker, attempt=attempt, reason="webhook_error")

@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import insert, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
-from app.models import Payment
+from app.infrastructure.database.models import PaymentRecord
 from tests.test_payments import row_counts
 
 
@@ -53,7 +53,7 @@ async def test_database_constraints(session_factory, field, value, constraint):
     values[field] = value
     with pytest.raises(IntegrityError) as exc:
         async with session_factory.begin() as session:
-            await session.execute(insert(Payment).values(**values))
+            await session.execute(insert(PaymentRecord).values(**values))
     assert constraint in str(exc.value.orig)
     assert await row_counts(session_factory) == (0, 0)
 
@@ -64,7 +64,7 @@ async def test_database_unique_idempotency_key(client, headers, payment_data, se
     with pytest.raises(IntegrityError) as exc:
         async with session_factory.begin() as session:
             await session.execute(
-                insert(Payment).values(
+                insert(PaymentRecord).values(
                     amount=Decimal("1.00"),
                     currency="RUB",
                     description="Duplicate",
@@ -80,7 +80,7 @@ async def test_database_numeric_overflow(session_factory):
     with pytest.raises(DBAPIError):
         async with session_factory.begin() as session:
             await session.execute(
-                insert(Payment).values(
+                insert(PaymentRecord).values(
                     amount=Decimal("10000000000000000.00"),
                     currency="RUB",
                     description="Too large",

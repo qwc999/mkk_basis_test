@@ -6,14 +6,14 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import func, select, text
 
-from app.models import Outbox, Payment
+from app.infrastructure.database.models import OutboxRecord, PaymentRecord
 
 
 async def row_counts(session_factory):
     async with session_factory() as session:
         return (
-            await session.scalar(select(func.count()).select_from(Payment)),
-            await session.scalar(select(func.count()).select_from(Outbox)),
+            await session.scalar(select(func.count()).select_from(PaymentRecord)),
+            await session.scalar(select(func.count()).select_from(OutboxRecord)),
         )
 
 
@@ -39,14 +39,14 @@ async def test_create_and_get_payment(client, headers, payment_data, session_fac
         "processed_at": None,
     }
     async with session_factory() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         assert payment.amount == Decimal("1500.00")
         assert isinstance(payment.amount, Decimal)
         assert payment.created_at == created_at
         assert payment.status == "pending"
         assert payment.processed_at is None
         assert payment.idempotency_key == headers["Idempotency-Key"]
-        event = (await session.scalars(select(Outbox))).one()
+        event = (await session.scalars(select(OutboxRecord))).one()
         assert event.event_type == "payments.new"
         assert event.payload == {"payment_id": str(payment_id)}
         assert event.published_at is None
@@ -244,7 +244,7 @@ async def test_outbox_failure_rolls_back_payment_and_event(
     client, headers, payment_data, engine, session_factory
 ):
     # A real PostgreSQL constraint error occurs after the payment INSERT,
-    # when the Outbox row is flushed at transaction commit.
+    # when the OutboxRecord row is flushed at transaction commit.
     async with engine.begin() as connection:
         await connection.execute(
             text(

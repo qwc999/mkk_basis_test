@@ -3,9 +3,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import router
 from app.config import Settings, load_settings
-from app.db import create_engine, create_session_factory
+from app.infrastructure.database.base import create_engine, create_session_factory
+from app.infrastructure.database.uow import create_uow_factory
+from app.presentation.api.routes import router
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         engine = create_engine(settings)
-        app.state.session_factory = create_session_factory(engine)
+        app.state.uows = create_uow_factory(create_session_factory(engine))
         logger.info("Payment API started")
         try:
             yield

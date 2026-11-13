@@ -6,8 +6,11 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import DatabaseSettings, load_settings
-from app.db import Base
-from app.models import Outbox, Payment  # noqa: F401 -- register the complete schema
+from app.infrastructure.database.base import Base
+from app.infrastructure.database.models import (  # noqa: F401 -- register the complete schema
+    OutboxRecord,
+    PaymentRecord,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 target_metadata = Base.metadata

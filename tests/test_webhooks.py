@@ -6,9 +6,10 @@ from uuid import UUID
 import httpx
 import pytest
 
-from app.models import Payment
-from app.processing import process_payment
-from app.webhooks import WebhookDeliveryError, create_http_client, deliver_webhook
+from app.application.errors import WebhookDeliveryError
+from app.infrastructure.database.models import PaymentRecord
+from app.infrastructure.webhooks import create_http_client
+from tests.integration_helpers import deliver_webhook, process_payment
 
 
 @pytest.mark.parametrize("status", ["succeeded", "failed"])
@@ -20,7 +21,7 @@ async def test_webhook_contract_and_duplicate_delivery(
     payment_id = UUID(response.json()["payment_id"])
     await process_payment(session_factory, payment_id, AsyncMock(return_value=status))
     async with session_factory() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         processed_at = payment.processed_at
         assert payment.webhook_delivered_at is None
     requests = []
@@ -48,14 +49,14 @@ async def test_webhook_contract_and_duplicate_delivery(
         before = datetime.now(UTC)
         await deliver_webhook(session_factory, payment_id, http)
         async with session_factory() as session:
-            payment = await session.get(Payment, payment_id)
+            payment = await session.get(PaymentRecord, payment_id)
             delivered_at = payment.webhook_delivered_at
             assert before <= delivered_at <= datetime.now(UTC)
             assert delivered_at.utcoffset().total_seconds() == 0
         await deliver_webhook(session_factory, payment_id, http)
     assert len(requests) == 1
     async with session_factory() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         assert payment.webhook_delivered_at == delivered_at
         assert (payment.status, payment.processed_at) == (status, processed_at)
 
@@ -75,7 +76,7 @@ async def test_failed_webhook_has_no_delivery_mark(
             raise failure("sensitive URL and response must not be logged", request=request)
         return httpx.Response(failure, headers={"Location": "https://redirect.example/"})
 
-    expected = failure if isinstance(failure, type) else WebhookDeliveryError
+    expected = WebhookDeliveryError
     # Even a client configured to follow redirects must not follow a webhook redirect.
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(receive), follow_redirects=True
@@ -84,6 +85,6 @@ async def test_failed_webhook_has_no_delivery_mark(
             await deliver_webhook(session_factory, payment_id, http)
     assert len(requests) == 1
     async with session_factory() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         assert payment.webhook_delivered_at is None
         assert payment.status == "succeeded" and payment.processed_at is not None

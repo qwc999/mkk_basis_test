@@ -5,24 +5,25 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aio_pika import DeliveryMode
-from aio_pika.exceptions import ChannelInvalidStateError, PublishError
+from aio_pika.exceptions import ChannelInvalidStateError
 from sqlalchemy import select
 
-from app.messaging import PAYMENTS_EXCHANGE, PAYMENTS_QUEUE
-from app.models import Outbox
-from app.outbox import PublicationNotConfirmed, publish_one, publish_outbox
+from app.application.errors import PublicationError, PublicationNotConfirmed
+from app.infrastructure.database.models import OutboxRecord
+from app.infrastructure.messaging import PAYMENTS_EXCHANGE, PAYMENTS_QUEUE
+from tests.integration_helpers import publish_one, publish_outbox
 
 
 async def create_event(client, headers, payment_data, session_factory):
     response = await client.post("/api/v1/payments", headers=headers, json=payment_data)
     assert response.status_code == 202
     async with session_factory() as session:
-        return (await session.scalars(select(Outbox))).one()
+        return (await session.scalars(select(OutboxRecord))).one()
 
 
 async def published_at(session_factory, event_id):
     async with session_factory() as session:
-        return (await session.get(Outbox, event_id)).published_at
+        return (await session.get(OutboxRecord, event_id)).published_at
 
 
 async def test_publish_persistent_message_and_timestamp(
@@ -67,7 +68,7 @@ async def test_publish_error_keeps_event_pending(
     event = await create_event(client, headers, payment_data, session_factory)
     broker, _ = rabbit
     monkeypatch.setattr(broker, "publish", AsyncMock(side_effect=failure))
-    with pytest.raises(type(failure)):
+    with pytest.raises(PublicationError):
         await publish_one(session_factory, broker, 0.1)
     assert await published_at(session_factory, event.id) is None
 
@@ -93,7 +94,7 @@ async def test_publish_timeout_keeps_event_pending(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(broker, "publish", stalled)
-    with pytest.raises(TimeoutError):
+    with pytest.raises(PublicationError):
         await publish_one(session_factory, broker, 0.05)
     assert await published_at(session_factory, event.id) is None
 
@@ -106,7 +107,7 @@ async def test_unroutable_event_is_not_marked_published(
     exchange = await broker.declare_exchange(PAYMENTS_EXCHANGE)
     await queue.unbind(exchange, routing_key=PAYMENTS_QUEUE.routing_key)
     try:
-        with pytest.raises(PublishError):
+        with pytest.raises(PublicationError):
             await publish_one(session_factory, broker, 1)
         assert await published_at(session_factory, event.id) is None
         assert await queue.get(fail=False) is None
