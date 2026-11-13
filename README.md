@@ -196,6 +196,13 @@ docker compose exec rabbitmq rabbitmqctl list_queues -p payments name messages_r
 
 ## Проверки
 
+Прикладные сценарии и доменные правила можно проверить без PostgreSQL и RabbitMQ
+после установки `requirements-dev.txt`:
+
+```sh
+python -m pytest -q tests/unit tests/test_architecture.py
+```
+
 Полный набор на выделенных PostgreSQL и RabbitMQ, без рабочего `.env`:
 
 ```sh
@@ -234,6 +241,10 @@ python scripts/smoke_processing.py
 
 ## Решения и ограничения
 
+- Слои: `domain` — независимые объекты и правила; `application` — сценарии и интерфейсы;
+  `infrastructure` — SQLAlchemy-репозитории, Unit of Work, шлюз, HTTP и RabbitMQ;
+  `presentation/api` — FastAPI и Pydantic. `main.py` и `worker.py` собирают зависимости.
+  В прикладном и доменном слоях нет импортов SQLAlchemy, httpx или FastStream.
 - Payment и Outbox создаются атомарно. Отправитель выбирает записи через
   `FOR UPDATE SKIP LOCKED` и фиксирует published_at только после подтверждения брокера.
 - Гарантия — **at least once**: авария между HTTP 2xx и сохранением отметки или между
