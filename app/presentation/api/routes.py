@@ -4,13 +4,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.security import APIKeyHeader
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_session
-from app.json_request import PaymentJSONRoute
-from app.models import Payment
-from app.payments import IdempotencyConflict, create_payment
-from app.schemas import IdempotencyKey, PaymentAccepted, PaymentCreate, PaymentDetail
+from app.application.payments import create_payment
+from app.application.payments import get_payment as read_payment
+from app.application.ports import UnitOfWorkFactory
+from app.domain.errors import IdempotencyConflict, PaymentNotFound
+from app.domain.models import Payment, PaymentDraft
+from app.presentation.api.json_request import PaymentJSONRoute
+from app.presentation.api.schemas import (
+    IdempotencyKey,
+    PaymentAccepted,
+    PaymentCreate,
+    PaymentDetail,
+)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -26,7 +32,13 @@ router = APIRouter(
     dependencies=[Depends(authenticate)],
     route_class=PaymentJSONRoute,
 )
-Session = Annotated[AsyncSession, Depends(get_session)]
+
+
+def get_uows(request: Request) -> UnitOfWorkFactory:
+    return request.app.state.uows
+
+
+Uows = Annotated[UnitOfWorkFactory, Depends(get_uows)]
 
 
 def accepted(payment: Payment) -> PaymentAccepted:
@@ -38,13 +50,19 @@ def accepted(payment: Payment) -> PaymentAccepted:
 @router.post("", response_model=PaymentAccepted, status_code=status.HTTP_202_ACCEPTED)
 async def post_payment(
     data: PaymentCreate,
-    session: Session,
+    uows: Uows,
     idempotency_key: Annotated[IdempotencyKey, Header()],
 ) -> PaymentAccepted:
     if "\x00" in idempotency_key:
         raise HTTPException(status_code=422, detail="Invalid Idempotency-Key")
     try:
-        payment = await create_payment(session, data, idempotency_key)
+        payment = await create_payment(
+            uows,
+            PaymentDraft(
+                data.amount, data.currency, data.description, data.metadata, str(data.webhook_url)
+            ),
+            idempotency_key,
+        )
     except IdempotencyConflict:
         raise HTTPException(
             status_code=409, detail="Idempotency-Key was used with different data"
@@ -53,16 +71,17 @@ async def post_payment(
 
 
 @router.get("/{payment_id}", response_model=PaymentDetail)
-async def get_payment(payment_id: UUID, session: Session) -> PaymentDetail:
-    payment = await session.get(Payment, payment_id)
-    if payment is None:
-        raise HTTPException(status_code=404, detail="Payment not found")
+async def get_payment(payment_id: UUID, uows: Uows) -> PaymentDetail:
+    try:
+        payment = await read_payment(uows, payment_id)
+    except PaymentNotFound:
+        raise HTTPException(status_code=404, detail="Payment not found") from None
     return PaymentDetail(
         **accepted(payment).model_dump(),
         amount=payment.amount,
         currency=payment.currency,
         description=payment.description,
-        metadata=payment.payment_metadata,
+        metadata=payment.metadata,
         webhook_url=payment.webhook_url,
         processed_at=payment.processed_at,
     )

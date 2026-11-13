@@ -31,6 +31,7 @@ class DatabaseSettings(BaseSettings):
 
 class Settings(DatabaseSettings):
     api_key: SecretStr
+    enable_docs: bool = False
 
     @field_validator("api_key")
     @classmethod

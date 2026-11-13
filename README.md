@@ -60,6 +60,7 @@ docker compose run --rm api python -m alembic check
 | `RABBITMQ_URL` | Подключение consumer, схема `amqp` или `amqps` |
 | `RABBITMQ_USER`, `RABBITMQ_PASSWORD`, `RABBITMQ_VHOST` | Инициализация RabbitMQ; должны соответствовать RABBITMQ_URL |
 | `API_PORT` | Порт API на хосте, по умолчанию `8000` |
+| `ENABLE_DOCS` | Локальный Swagger, по умолчанию `false` |
 | `OUTBOX_POLL_INTERVAL` | Пауза пустого Outbox, по умолчанию `1` секунда |
 | `OUTBOX_PUBLISH_TIMEOUT` | Лимит публикации и подтверждения Outbox/retry/DLQ, по умолчанию `5` секунд |
 
@@ -70,8 +71,13 @@ docker compose run --rm api python -m alembic check
 
 ## API
 
-Все эндпоинты требуют `X-API-Key`; отсутствие или неверное значение даёт `401`.
-Swagger, ReDoc и `/openapi.json` отключены. Примеры ниже — для Bash; в PowerShell
+Платёжные эндпоинты требуют `X-API-Key`; отсутствие или неверное значение даёт `401`.
+Swagger и `/openapi.json` по умолчанию отключены, ReDoc отключён всегда.
+Для локальной проверки задайте `ENABLE_DOCS=true` в `.env`, пересоберите и перезапустите
+API: `docker compose up -d --build --no-deps api`. Откройте `http://localhost:8000/docs`,
+нажмите **Authorize** и введите значение `API_KEY` для запросов к платежам.
+В этом режиме сама документация и схема доступны без ключа; используйте его только локально.
+Примеры ниже — для Bash; в PowerShell
 используйте `curl.exe` или `Invoke-RestMethod` с теми же заголовками.
 
 Задайте свой ключ из `.env` и URL получателя, доступный **из consumer-контейнера**:
@@ -190,6 +196,13 @@ docker compose exec rabbitmq rabbitmqctl list_queues -p payments name messages_r
 
 ## Проверки
 
+Прикладные сценарии и доменные правила можно проверить без PostgreSQL и RabbitMQ
+после установки `requirements-dev.txt`:
+
+```sh
+python -m pytest -q tests/unit tests/test_architecture.py
+```
+
 Полный набор на выделенных PostgreSQL и RabbitMQ, без рабочего `.env`:
 
 ```sh
@@ -228,6 +241,10 @@ python scripts/smoke_processing.py
 
 ## Решения и ограничения
 
+- Слои: `domain` — независимые объекты и правила; `application` — сценарии и интерфейсы;
+  `infrastructure` — SQLAlchemy-репозитории, Unit of Work, шлюз, HTTP и RabbitMQ;
+  `presentation/api` — FastAPI и Pydantic. `main.py` и `worker.py` собирают зависимости.
+  В прикладном и доменном слоях нет импортов SQLAlchemy, httpx или FastStream.
 - Payment и Outbox создаются атомарно. Отправитель выбирает записи через
   `FOR UPDATE SKIP LOCKED` и фиксирует published_at только после подтверждения брокера.
 - Гарантия — **at least once**: авария между HTTP 2xx и сохранением отметки или между

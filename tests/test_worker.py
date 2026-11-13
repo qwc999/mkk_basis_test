@@ -10,15 +10,17 @@ import pytest
 from faststream.rabbit import Channel, RabbitBroker
 from sqlalchemy import select, text
 
-from app.messaging import (
+from app.application.consumer import consume_payment as handle_payment
+from app.infrastructure.database.models import OutboxRecord, PaymentRecord
+from app.infrastructure.messaging import (
     DLQ_QUEUE,
     PAYMENTS_EXCHANGE,
     PAYMENTS_QUEUE,
     create_broker,
     declare_topology,
 )
-from app.models import Outbox, Payment
-from app.worker import consume_payment, run_worker
+from app.worker import run_worker
+from tests.integration_helpers import FunctionGateway, consume_payment
 
 
 @pytest.fixture(autouse=True)
@@ -40,7 +42,7 @@ async def wait_until(check):
 @asynccontextmanager
 async def worker(settings, simulator):
     stop = asyncio.Event()
-    task = asyncio.create_task(run_worker(settings, stop, simulator))
+    task = asyncio.create_task(run_worker(settings, stop, FunctionGateway(simulator)))
     try:
         yield task, stop
     finally:
@@ -50,7 +52,7 @@ async def worker(settings, simulator):
 
 async def payment_state(sessions, payment_id):
     async with sessions() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         return payment.status, payment.processed_at
 
 
@@ -94,7 +96,7 @@ async def test_worker_processes_outbox_and_ignores_duplicate_message_ids(
     simulator.assert_awaited_once()
     assert await payment_state(session_factory, payment_id) == original
     async with session_factory() as session:
-        event = (await session.scalars(select(Outbox))).one()
+        event = (await session.scalars(select(OutboxRecord))).one()
         assert event.published_at is not None
     assert await queue.get(fail=False) is None
 
@@ -106,7 +108,7 @@ async def test_technical_failure_uses_scheduled_retry(
     payment_id = UUID(response.json()["payment_id"])
     simulator = AsyncMock(side_effect=[RuntimeError("technical failure"), "succeeded"])
     deliveries = []
-    original = consume_payment
+    original = handle_payment
 
     async def observe(message, *args, **kwargs):
         deliveries.append(message.headers.get("x-attempt", 1))
@@ -338,7 +340,7 @@ async def test_prefetch_one_serializes_real_handler(
 
     async def all_published():
         async with session_factory() as session:
-            events = (await session.scalars(select(Outbox))).all()
+            events = (await session.scalars(select(OutboxRecord))).all()
             return all(event.published_at is not None for event in events)
 
     async with worker(worker_settings, simulator):

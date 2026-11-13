@@ -10,9 +10,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from app.config import Settings, WorkerSettings
-from app.db import create_engine, create_session_factory
+from app.infrastructure.database.base import create_engine, create_session_factory
+from app.infrastructure.messaging import DLQ_QUEUE, RETRY_QUEUES, create_broker, declare_topology
 from app.main import create_app
-from app.messaging import DLQ_QUEUE, RETRY_QUEUES, create_broker, declare_topology
 
 TEST_API_KEY = "test-only-api-key"
 

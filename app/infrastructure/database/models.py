@@ -16,10 +16,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db import Base
+from app.infrastructure.database.base import Base
 
 
-class Payment(Base):
+class PaymentRecord(Base):
     __tablename__ = "payments"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
@@ -50,7 +50,7 @@ class Payment(Base):
     webhook_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
-class Outbox(Base):
+class OutboxRecord(Base):
     __tablename__ = "outbox"
     __table_args__ = (
         Index(

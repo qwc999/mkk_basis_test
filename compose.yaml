@@ -23,6 +23,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
       API_KEY: ${API_KEY:?Set API_KEY in .env}
+      ENABLE_DOCS: ${ENABLE_DOCS:-false}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:

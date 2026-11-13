@@ -6,8 +6,10 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import text
 
-from app.models import Payment
-from app.processing import PaymentNotFound, process_payment, simulate_payment
+from app.domain.errors import PaymentNotFound
+from app.infrastructure.database.models import PaymentRecord
+from app.infrastructure.gateway import simulate_payment
+from tests.integration_helpers import process_payment
 
 
 @pytest.mark.parametrize("result", ["succeeded", "failed"])
@@ -21,7 +23,7 @@ async def test_processing_stores_final_result(
     await process_payment(session_factory, payment_id, simulator)
     after = datetime.now(UTC)
     async with session_factory() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         assert payment.status == result
         assert before <= payment.processed_at <= after
         assert payment.processed_at.utcoffset() == timedelta(0)
@@ -101,7 +103,7 @@ async def test_failed_or_cancelled_processing_rolls_back(
     with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
         await task
     async with session_factory() as session:
-        payment = await session.get(Payment, payment_id)
+        payment = await session.get(PaymentRecord, payment_id)
         assert payment.status == "pending"
         assert payment.processed_at is None
     await process_payment(session_factory, payment_id, AsyncMock(return_value="failed"))
@@ -122,8 +124,8 @@ async def test_emulator_is_async_and_has_deterministic_boundaries(
     monkeypatch, random_value, result
 ):
     sleep = AsyncMock()
-    monkeypatch.setattr("app.processing.asyncio.sleep", sleep)
-    monkeypatch.setattr("app.processing.random.uniform", lambda low, high: 3.25)
-    monkeypatch.setattr("app.processing.random.random", lambda: random_value)
+    monkeypatch.setattr("app.infrastructure.gateway.asyncio.sleep", sleep)
+    monkeypatch.setattr("app.infrastructure.gateway.random.uniform", lambda low, high: 3.25)
+    monkeypatch.setattr("app.infrastructure.gateway.random.random", lambda: random_value)
     assert await simulate_payment() == result
     sleep.assert_awaited_once_with(3.25)

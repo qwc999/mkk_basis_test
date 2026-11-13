@@ -255,9 +255,11 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
         publisher = """
     import asyncio
     from app.config import WorkerSettings,load_settings
-    from app.db import create_engine,create_session_factory
-    from app.messaging import create_broker,declare_topology
-    from app.outbox import publish_one
+    from app.infrastructure.database.base import create_engine,create_session_factory
+    from app.infrastructure.messaging import create_broker,declare_topology
+    from app.application.outbox import publish_one
+    from app.infrastructure.database.uow import create_uow_factory
+    from app.infrastructure.messaging import RabbitEventPublisher
     async def once():
         settings=load_settings(WorkerSettings)
         engine=create_engine(settings)
@@ -265,7 +267,8 @@ def run_smoke(source: Path, artifacts: Path, project: str) -> None:
         try:
             await broker.connect()
             await declare_topology(broker)
-            assert await publish_one(create_session_factory(engine),broker,5)
+            uows = create_uow_factory(create_session_factory(engine))
+            assert await publish_one(uows, RabbitEventPublisher(broker,5))
         finally:
             await broker.stop()
             await engine.dispose()

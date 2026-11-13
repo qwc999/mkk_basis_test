@@ -4,7 +4,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import update
 
-from app.models import Payment
+from app.infrastructure.database.models import PaymentRecord
 from tests.test_payments import row_counts
 
 
@@ -83,8 +83,8 @@ async def test_replay_returns_current_status(client, headers, payment_data, sess
     assert first.status_code == 202
     async with session_factory.begin() as session:
         await session.execute(
-            update(Payment)
-            .where(Payment.id == UUID(first.json()["payment_id"]))
+            update(PaymentRecord)
+            .where(PaymentRecord.id == UUID(first.json()["payment_id"]))
             .values(status="succeeded")
         )
     second = await client.post("/api/v1/payments", headers=headers, json=payment_data)

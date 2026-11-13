@@ -4,8 +4,8 @@ from uuid import UUID
 import httpx
 from sqlalchemy import text
 
-from app.models import Payment
-from app.worker import consume_payment
+from app.infrastructure.database.models import PaymentRecord
+from tests.integration_helpers import consume_payment
 from tests.test_worker import payment_state, queue_empty, send, wait_until
 
 
@@ -29,7 +29,7 @@ async def test_webhook_retry_preserves_result_and_skips_simulator(
         original = await payment_state(session_factory, payment_id)
         assert original[0] == "failed" and original[1] is not None
         async with session_factory() as session:
-            assert (await session.get(Payment, payment_id)).webhook_delivered_at is None
+            assert (await session.get(PaymentRecord, payment_id)).webhook_delivered_at is None
 
         async def returned():
             return not await queue_empty(queue)
@@ -42,7 +42,7 @@ async def test_webhook_retry_preserves_result_and_skips_simulator(
     simulator.assert_awaited_once()
     assert await payment_state(session_factory, payment_id) == original
     async with session_factory() as session:
-        assert (await session.get(Payment, payment_id)).webhook_delivered_at is not None
+        assert (await session.get(PaymentRecord, payment_id)).webhook_delivered_at is not None
     assert len(requests) == 2
     assert all(request.headers["Idempotency-Key"] == str(payment_id) for request in requests)
     assert "sensitive-response" not in caplog.text
@@ -64,7 +64,7 @@ async def test_delivery_commit_failure_requires_retry_handoff_before_ack(
         # A successful HTTP response alone must never ACK the original delivery.
         assert not message.processed
         async with session_factory() as session:
-            payment = await session.get(Payment, payment_id)
+            payment = await session.get(PaymentRecord, payment_id)
             assert payment.status == "succeeded" and payment.processed_at is not None
             assert payment.webhook_delivered_at is None
         transfers.append(kwargs)
